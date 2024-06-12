@@ -1,0 +1,23 @@
+syntax = "proto3";
+package smsff.api;
+option go_package = "smsff/api";
+
+import "github.com/gogo/protobuf/gogoproto/gogo.proto";
+import "google/api/annotations.proto";
+
+service SmsFF {
+  rpc SendSms (SendSmsReq) returns (SendSmsResp)  {
+    option (google.api.http) = {
+      post: "/sendsms",
+      body: "*",
+    };
+  }
+}
+
+message SendSmsReq {
+  string text = 1;
+}
+
+message SendSmsResp {
+
+}
