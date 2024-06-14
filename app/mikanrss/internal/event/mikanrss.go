@@ -2,27 +2,38 @@ package event
 
 import (
 	"a1in-bot/app/mikanrss/internal/model"
+	"a1in-bot/app/mikanrss/internal/repo"
 	"context"
+	"encoding/xml"
 	"fmt"
 	qqbot "qqbot/api"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/go-kratos/kratos/v2/log"
 )
 
 type MikanRSSEventHandler struct {
-	proxy qqbot.ProxyClient
+	proxy         qqbot.ProxyClient
+	mikan         *repo.MikanClient
+	user_rss_map  map[int64]string
+	rss_mu        sync.RWMutex
+	user_read_map map[int64]map[string]struct{}
+	read_mu       sync.RWMutex
 }
 
 func NewMikanRSSEventHandler(proxy qqbot.ProxyClient) *MikanRSSEventHandler {
 	return &MikanRSSEventHandler{
-		proxy: proxy,
+		mikan:         repo.NewMikanClient(),
+		proxy:         proxy,
+		user_rss_map:  make(map[int64]string),
+		user_read_map: map[int64]map[string]struct{}{},
 	}
 }
 
 func (h *MikanRSSEventHandler) Match(event *qqbot.NotifyEvent) (isMatch bool) {
-	defer log.Infof("[mikan] event: %v, isMatch: %v", event, isMatch)
+	// defer log.Infof("[mikan] event: %v, isMatch: %v", event, isMatch)
 	isMatch = false
 	if event.GetPostType() != model.PostTypeMessage {
 		return
@@ -43,7 +54,7 @@ func (h *MikanRSSEventHandler) Match(event *qqbot.NotifyEvent) (isMatch bool) {
 	if eventData.GroupMsg.GetMessage()[1].Type != model.SegmentTypeText {
 		return
 	}
-	if !strings.HasPrefix(strings.TrimLeft(eventData.GroupMsg.GetMessage()[1].Data.Text, " "), "mikan") {
+	if strings.Split(strings.TrimLeft(eventData.GroupMsg.GetMessage()[1].Data.Text, " "), " ")[0] != "mikan" {
 		return
 	}
 	if len(strings.Split(strings.TrimLeft(eventData.GroupMsg.GetMessage()[1].Data.Text, " "), " ")) != 3 {
@@ -53,16 +64,71 @@ func (h *MikanRSSEventHandler) Match(event *qqbot.NotifyEvent) (isMatch bool) {
 	return
 }
 
+// mikan bind url
+// mikan unbind url
 func (h *MikanRSSEventHandler) Handle(event *qqbot.NotifyEvent) {
 	eventData := event.NotifyEventData.(*qqbot.NotifyEvent_GroupMsg)
 	cmd := strings.Split(strings.TrimLeft(eventData.GroupMsg.GetMessage()[1].Data.Text, " "), " ")
-	if cmd[1] == "test" {
+	userId := eventData.GroupMsg.GetUserId()
+	groupId := eventData.GroupMsg.GetGroupId()
+	operation := cmd[1]
+	rssUrl := cmd[2]
+	if operation == "bind" {
+		// 先验证这个链接是不是有效，无效直接返回
+		rssData, err := h.mikan.Call(rssUrl)
+		if err != nil {
+			log.Errorf("[mikan] operation bind, get rss feed err: %v", err)
+			h.proxy.SendGroupMsg(context.Background(), &qqbot.SendGroupMsgReq{
+				GroupId: groupId,
+				Message: []*qqbot.Segment{qqbot.BuildAtSegment(strconv.FormatInt(userId, 10)), qqbot.BuildTextSegment(fmt.Sprintf(" 从指定链接获取数据失败：%v", err))},
+			})
+			return
+		}
+		rssFeed := &model.MikanRSSFeed{}
+		err = xml.Unmarshal(rssData, rssFeed)
+		if err != nil {
+			log.Errorf("[mikan] operation bind, unmarshal rss feed err: %v", err)
+			h.proxy.SendGroupMsg(context.Background(), &qqbot.SendGroupMsgReq{
+				GroupId: groupId,
+				Message: []*qqbot.Segment{qqbot.BuildAtSegment(strconv.FormatInt(userId, 10)), qqbot.BuildTextSegment(fmt.Sprintf(" 从指定链接解析数据失败：%v", err))},
+			})
+			return
+		}
+
+		// 有效后再检查以前有没有绑定过
+		h.rss_mu.Lock()
+		if oldRss, ok := h.user_rss_map[userId]; ok {
+			log.Infof("[mikan] operation bind, user %v has bind rss url %v", userId, oldRss)
+			h.proxy.SendGroupMsg(context.Background(), &qqbot.SendGroupMsgReq{
+				GroupId: groupId,
+				Message: []*qqbot.Segment{qqbot.BuildAtSegment(strconv.FormatInt(userId, 10)), qqbot.BuildTextSegment(fmt.Sprintf(" 之前已绑定过 Mikan RSS 链接：%v，已更换为指定链接", oldRss))},
+			})
+		} else {
+			log.Infof("[mikan] operation bind, user %v bind rss url %v", userId, rssUrl)
+			h.proxy.SendGroupMsg(context.Background(), &qqbot.SendGroupMsgReq{
+				GroupId: groupId,
+				Message: []*qqbot.Segment{qqbot.BuildAtSegment(strconv.FormatInt(userId, 10)), qqbot.BuildTextSegment(" 成功绑定 Mikan RSS 链接")},
+			})
+		}
+		h.user_rss_map[userId] = rssUrl
+		h.rss_mu.Unlock()
+
+		h.read_mu.Lock()
+		text := " 你的 Mikan RSS 源现在有以下内容\n\n"
+		for _, item := range rssFeed.Channel.Items {
+			text += fmt.Sprintf("标题：%v\nMikan 链接：%v\n种子地址：%v\n\n", item.Description, item.Link, item.Enclosure.URL)
+			_, ok := h.user_read_map[userId]
+			if !ok {
+				h.user_read_map[userId] = make(map[string]struct{})
+			}
+			h.user_read_map[userId][item.Link] = struct{}{}
+		}
+		h.read_mu.Unlock()
+
 		h.proxy.SendGroupMsg(context.Background(), &qqbot.SendGroupMsgReq{
-			GroupId: eventData.GroupMsg.GroupId,
-			Message: []*qqbot.Segment{
-				qqbot.BuildAtSegment(strconv.FormatInt(eventData.GroupMsg.UserId, 10)),
-				qqbot.BuildTextSegment(fmt.Sprintf(" %v", cmd[2])),
-			},
+			GroupId: groupId,
+			Message: []*qqbot.Segment{qqbot.BuildAtSegment(strconv.FormatInt(userId, 10)), qqbot.BuildTextSegment(text)},
 		})
 	}
+
 }

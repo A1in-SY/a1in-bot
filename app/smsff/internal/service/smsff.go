@@ -32,7 +32,7 @@ func (s *SmsFFService) SendSms(ctx context.Context, req *api.SendSmsReq) (resp *
 	defer log.Context(ctx).Infof("[SmsFFService] req: %v, resp: %v, err: %v")
 	_, err = s.proxy.SendGroupMsg(ctx, &qqbot.SendGroupMsgReq{
 		GroupId:    253016320,
-		Message:    req.GetText(),
+		Message:    []*qqbot.Segment{qqbot.BuildTextSegment(req.GetText())},
 		AutoEscape: false,
 	})
 	return
