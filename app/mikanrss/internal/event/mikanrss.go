@@ -4,8 +4,10 @@ import (
 	"a1in-bot/app/mikanrss/internal/model"
 	"a1in-bot/app/mikanrss/internal/repo"
 	"context"
+	"encoding/json"
 	"encoding/xml"
 	"fmt"
+	"os"
 	qqbot "qqbot/api"
 	"strconv"
 	"strings"
@@ -24,11 +26,42 @@ type MikanRSSEventHandler struct {
 }
 
 func NewMikanRSSEventHandler(proxy qqbot.ProxyClient) *MikanRSSEventHandler {
+	m1 := make(map[int64]string)
+	m2 := make(map[int64]map[string]struct{})
+	if _, err := os.Stat("user_rss_map.json"); os.IsNotExist(err) {
+		d1, _ := json.Marshal(m1)
+		d2, _ := json.Marshal(m2)
+		err := os.WriteFile("user_rss_map.json", d1, 0644)
+		if err != nil {
+			panic(err)
+		}
+		err = os.WriteFile("user_read_map.json", d2, 0644)
+		if err != nil {
+			panic(err)
+		}
+	} else {
+		d1, err := os.ReadFile("user_rss_map.json")
+		if err != nil {
+			panic(err)
+		}
+		err = json.Unmarshal(d1, &m1)
+		if err != nil {
+			panic(err)
+		}
+		d2, err := os.ReadFile("user_read_map.json")
+		if err != nil {
+			panic(err)
+		}
+		err = json.Unmarshal(d2, &m2)
+		if err != nil {
+			panic(err)
+		}
+	}
 	return &MikanRSSEventHandler{
 		mikan:         repo.NewMikanClient(),
 		proxy:         proxy,
-		user_rss_map:  make(map[int64]string),
-		user_read_map: map[int64]map[string]struct{}{},
+		user_rss_map:  m1,
+		user_read_map: m2,
 	}
 }
 
@@ -111,6 +144,15 @@ func (h *MikanRSSEventHandler) Handle(event *qqbot.NotifyEvent) {
 			})
 		}
 		h.user_rss_map[userId] = rssUrl
+		d1, _ := json.Marshal(h.user_rss_map)
+		err = os.WriteFile("user_rss_map.json", d1, 0644)
+		if err != nil {
+			log.Errorf("[mikan] operation bind, write user_rss_map.json err: %v", err)
+			h.proxy.SendGroupMsg(context.Background(), &qqbot.SendGroupMsgReq{
+				GroupId: groupId,
+				Message: []*qqbot.Segment{qqbot.BuildAtSegment(strconv.FormatInt(userId, 10)), qqbot.BuildTextSegment(" 持久化数据时失败，叫开发出来挨打")},
+			})
+		}
 		h.rss_mu.Unlock()
 
 		h.read_mu.Lock()
@@ -123,6 +165,15 @@ func (h *MikanRSSEventHandler) Handle(event *qqbot.NotifyEvent) {
 			}
 			h.user_read_map[userId][item.Link] = struct{}{}
 		}
+		d2, _ := json.Marshal(h.user_read_map)
+		err = os.WriteFile("user_read_map.json", d2, 0644)
+		if err != nil {
+			log.Errorf("[mikan] operation bind, write user_read_map.json err: %v", err)
+			h.proxy.SendGroupMsg(context.Background(), &qqbot.SendGroupMsgReq{
+				GroupId: groupId,
+				Message: []*qqbot.Segment{qqbot.BuildAtSegment(strconv.FormatInt(userId, 10)), qqbot.BuildTextSegment(" 持久化数据时失败，叫开发出来挨打")},
+			})
+		}
 		h.read_mu.Unlock()
 
 		h.proxy.SendGroupMsg(context.Background(), &qqbot.SendGroupMsgReq{
@@ -130,5 +181,4 @@ func (h *MikanRSSEventHandler) Handle(event *qqbot.NotifyEvent) {
 			Message: []*qqbot.Segment{qqbot.BuildAtSegment(strconv.FormatInt(userId, 10)), qqbot.BuildTextSegment(text)},
 		})
 	}
-
 }
